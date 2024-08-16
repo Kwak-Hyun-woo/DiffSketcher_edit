@@ -63,10 +63,10 @@ class ModelState:
         results_folder = self.args.get("results_path", None)
         if results_folder is None:
             # self.results_path = Path("./workdir") / f"{config_prefix}-{config_name_only}"
-            self.results_path = Path("./workdir") / f"{config_name_only}"
+            self.results_path = Path("./workdir")
         else:
             # self.results_path = Path(results_folder) / f"{config_prefix}-{config_name_only}"
-            self.results_path = Path(results_folder) / f"{config_name_only}"
+            self.results_path = Path(results_folder) 
 
         # update results_path: ./runs/{method_name}-{exp_name}/{log_path_suffix}
         # noting: can be understood as "results dir / methods / ablation study / your result"

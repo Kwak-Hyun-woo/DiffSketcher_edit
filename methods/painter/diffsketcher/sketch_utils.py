@@ -170,3 +170,6 @@ def fix_image_scale(im):
                       * 255).astype(np.uint8)
     new_im = Image.fromarray(new_background)
     return new_im
+
+def save_points_param(param, save_path, name):
+    torch.save(param, f"{save_path}/{name}.pt")

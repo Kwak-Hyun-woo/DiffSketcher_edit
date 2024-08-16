@@ -66,16 +66,19 @@ class Painter(nn.Module):
         self.thresh = self.set_attention_threshold_map() if self.attention_init else None
         self.strokes_counter = 0  # counts the number of calls to "get_path"
 
+        # points 
+        self.points = []
+
     def init_image(self, stage=0):
         if stage > 0:
             # Noting: if multi stages training than add new strokes on existing ones
             # don't optimize on previous strokes
             self.optimize_flag = [False for i in range(len(self.shapes))]
-            for i in range(self.strokes_per_stage):
+            for i in range(self.strokes_per_stage): # # of stroke
                 stroke_color = torch.FloatTensor(np.random.uniform(size=[4])) \
                     if self.args.optim_rgba else torch.tensor([0.0, 0.0, 0.0, 1.0])
                 path = self.get_path()
-                self.shapes.append(path)
+                self.shapes.append(path)    # [num of stroke, num of points, 2]
                 path_group = pydiffvg.ShapeGroup(shape_ids=torch.tensor([len(self.shapes) - 1]),
                                                  fill_color=None,
                                                  stroke_color=stroke_color)
@@ -124,11 +127,11 @@ class Painter(nn.Module):
         self.num_control_points = torch.zeros(self.num_segments, dtype=torch.int32) + (self.control_points_per_seg - 2)
         points = []
         p0 = self.inds_normalised[self.strokes_counter] if self.attention_init else (random.random(), random.random())
-        points.append(p0)
+        points.append(p0)   # (x coor, y coor)
 
-        for j in range(self.num_segments):
+        for j in range(self.num_segments):  # 1
             radius = 0.05
-            for k in range(self.control_points_per_seg - 1):
+            for k in range(self.control_points_per_seg - 1):   # 4
                 p1 = (p0[0] + radius * (random.random() - 0.5), p0[1] + radius * (random.random() - 0.5))
                 points.append(p1)
                 p0 = p1
@@ -141,7 +144,7 @@ class Painter(nn.Module):
                              stroke_width=torch.tensor(self.width),
                              is_closed=False)
         self.strokes_counter += 1
-        return path
+        return path    # (num of points per single stroke, 2)
 
     def clip_curve_shape(self):
         if self.optim_width:
@@ -181,7 +184,7 @@ class Painter(nn.Module):
     def set_points_parameters(self):
         # stoke`s location optimization
         self.points_vars = []
-        for i, path in enumerate(self.shapes):
+        for i, path in enumerate(self.shapes):  # [num of stroke, num of points, 2]
             if self.optimize_flag[i]:
                 path.points.requires_grad = True
                 self.points_vars.append(path.points)
@@ -192,7 +195,7 @@ class Painter(nn.Module):
     def set_width_parameters(self):
         # stroke`s  width optimization
         self.stroke_width_vars = []
-        for i, path in enumerate(self.shapes):
+        for i, path in enumerate(self.shapes):   
             if self.optimize_flag[i]:
                 path.stroke_width.requires_grad = True
                 self.stroke_width_vars.append(path.stroke_width)

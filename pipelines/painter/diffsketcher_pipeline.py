@@ -5,6 +5,9 @@
 import pathlib
 from PIL import Image
 from functools import partial
+import os
+import time
+import itertools
 
 import torch
 import torch.nn.functional as F
@@ -14,15 +17,21 @@ from tqdm.auto import tqdm
 import numpy as np
 from skimage.color import rgb2gray
 import diffusers
+from libs.metric.loss import Loss
+
+from pipelines.painter.dataset import Sketchdataset
+import torchvision.transforms as transforms
+from torch.utils.data import DataLoader, Subset
+import torch.nn as nn
 
 from libs.engine import ModelState
 from libs.metric.lpips_origin import LPIPS
 from libs.metric.piq.perceptual import DISTS as DISTS_PIQ
 from libs.metric.clip_score import CLIPScoreWrapper
 from methods.painter.diffsketcher import (
-    Painter, SketchPainterOptimizer, Token2AttnMixinASDSPipeline, Token2AttnMixinASDSSDXLPipeline)
+    Painter, SketchPainterOptimizer, Token2AttnMixinASDSPipeline, Token2AttnMixinASDSSDXLPipeline, TokenImage2AttnMixinASDSPipeline)
 from methods.painter.diffsketcher.sketch_utils import (
-    log_tensor_img, plt_batch, plt_attn, save_tensor_img, fix_image_scale)
+    log_tensor_img, plt_batch, plt_attn, save_tensor_img, fix_image_scale, save_points_param)
 from methods.painter.diffsketcher.mask_utils import get_mask_u2net
 from methods.token2attn.attn_control import AttentionStore, EmptyControl
 from methods.token2attn.ptp_utils import view_images
@@ -30,35 +39,35 @@ from methods.diffusers_warp import init_diffusion_pipeline, model2res
 from methods.diffvg_warp import init_diffvg
 from methods.painter.diffsketcher.process_svg import remove_low_opacity_paths
 
-
 class DiffSketcherPipeline(ModelState):
 
     def __init__(self, args):
         attn_log_ = ""
-        if args.attention_init:
+        if args.attention_init and args.dataset==False:
             attn_log_ = f"-tk{args.token_ind}" \
                         f"{'-XDoG' if args.xdog_intersec else ''}" \
                         f"-atc{args.attn_coeff}-tau{args.softmax_temp}"
         logdir_ = f"sd{args.seed}-im{args.image_size}" \
                   f"-P{args.num_paths}W{args.width}{'OP' if args.optim_opacity else 'BL'}" \
                   f"{attn_log_}"
-        super().__init__(args, log_path_suffix=logdir_)
+        super().__init__(args, ignore_log=args.dataset)
 
         # create log dir
-        self.png_logs_dir = self.results_path / "png_logs"
-        self.svg_logs_dir = self.results_path / "svg_logs"
-        self.attn_logs_dir = self.results_path / "attn_logs"
-        if self.accelerator.is_main_process:
-            self.png_logs_dir.mkdir(parents=True, exist_ok=True)
-            self.svg_logs_dir.mkdir(parents=True, exist_ok=True)
-            self.attn_logs_dir.mkdir(parents=True, exist_ok=True)
+        if args.dataset==False:
+            self.png_logs_dir = self.results_path / "png_logs"
+            self.svg_logs_dir = self.results_path / "svg_logs"
+            self.attn_logs_dir = self.results_path / "attn_logs"
+            if self.accelerator.is_main_process:
+                self.png_logs_dir.mkdir(parents=True, exist_ok=True)
+                self.svg_logs_dir.mkdir(parents=True, exist_ok=True)
+                self.attn_logs_dir.mkdir(parents=True, exist_ok=True)
 
-        # make video log
-        self.make_video = self.args.make_video
-        if self.make_video:
-            self.frame_idx = 0
-            self.frame_log_dir = self.results_path / "frame_logs"
-            self.frame_log_dir.mkdir(parents=True, exist_ok=True)
+            # make video log
+            self.make_video = self.args.make_video
+            if self.make_video:
+                self.frame_idx = 0
+                self.frame_log_dir = self.results_path / "frame_logs"
+                self.frame_log_dir.mkdir(parents=True, exist_ok=True)
 
         init_diffvg(self.device, True, args.print_timing)
 
@@ -74,7 +83,8 @@ class DiffSketcherPipeline(ModelState):
             custom_pipeline = Token2AttnMixinASDSPipeline
             custom_scheduler = diffusers.DDIMScheduler
         else:  # sd14, sd15
-            custom_pipeline = Token2AttnMixinASDSPipeline
+            # custom_pipeline = Token2AttnMixinASDSPipeline
+            custom_pipeline = TokenImage2AttnMixinASDSPipeline
             custom_scheduler = diffusers.DDIMScheduler
 
         self.diffusion = init_diffusion_pipeline(
@@ -111,7 +121,125 @@ class DiffSketcherPipeline(ModelState):
                            attention_map=attention_map,
                            mask=mask)
         return renderer
+    
+    # custom "extract ldm attn"
+    def custom_extract_ldm_attn(self, prompts, img_path, img = None ):
+        # init controller
+        controller = AttentionStore() if self.args.attention_init else EmptyControl()
 
+        height = width = model2res(self.args.model_id)
+        # generated image as GT
+        if img_path == None:
+            if img != None:
+                outputs = self.diffusion(prompt=[prompts],
+                                        image = img,
+                                        negative_prompt=[self.args.negative_prompt],
+                                        height=height,
+                                        width=width,
+                                        controller=controller,
+                                        num_inference_steps=self.args.num_inference_steps,
+                                        guidance_scale=self.args.guidance_scale,
+                                        generator=self.g_device)
+            else:
+                outputs = self.diffusion(prompt=[prompts],
+                                        image = None,
+                                        negative_prompt=[self.args.negative_prompt],
+                                        height=height,
+                                        width=width,
+                                        controller=controller,
+                                        num_inference_steps=self.args.num_inference_steps,
+                                        guidance_scale=self.args.guidance_scale,
+                                        generator=self.g_device)
+        else:
+            # img -> torch (transform)
+            img = Image.open(img_path).convert('RGB')
+            img = transforms.ToTensor()(img)
+            outputs = self.diffusion(prompt=[prompts],
+                                    image = img,
+                                    negative_prompt=[self.args.negative_prompt],
+                                    height=height,
+                                    width=width,
+                                    controller=controller,
+                                    num_inference_steps=self.args.num_inference_steps,
+                                    guidance_scale=self.args.guidance_scale,
+                                    generator=self.g_device)
+    
+        
+
+        target_file = self.results_path / "ldm_generated_image.png"
+        target_img = view_images([np.array(img) for img in outputs.images], save_image=not self.args.dataset, fp=target_file)
+
+        if self.args.attention_init:
+            """ldm cross-attention map"""
+            cross_attention_maps, tokens = \
+                self.diffusion.get_cross_attention([prompts],
+                                                   controller,
+                                                   res=self.args.cross_attn_res,
+                                                   from_where=("up", "down"),
+                                                   save_path=self.results_path / "cross_attn.png",
+                                                   args = self.args)
+
+            # self.print(f"the length of tokens is {len(tokens)}, select {self.args.token_ind}-th token")
+            # [res, res, seq_len]
+            # self.print(f"origin cross_attn_map shape: {cross_attention_maps.shape}")
+            # [res, res]
+            cross_attn_map = cross_attention_maps[:, :, self.args.token_ind]
+            # self.print(f"select cross_attn_map shape: {cross_attn_map.shape}\n")
+            cross_attn_map = 255 * cross_attn_map / cross_attn_map.max()
+            # [res, res, 3]
+            cross_attn_map = cross_attn_map.unsqueeze(-1).expand(*cross_attn_map.shape, 3)
+            # [3, res, res]
+            cross_attn_map = cross_attn_map.permute(2, 0, 1).unsqueeze(0)
+            # [3, clip_size, clip_size]
+            cross_attn_map = F.interpolate(cross_attn_map, size=self.args.image_size, mode='bicubic')
+            cross_attn_map = torch.clamp(cross_attn_map, min=0, max=255)
+            # rgb to gray
+            cross_attn_map = rgb2gray(cross_attn_map.squeeze(0).permute(1, 2, 0)).astype(np.float32)
+            # torch to numpy
+            if cross_attn_map.shape[-1] != self.args.image_size and cross_attn_map.shape[-2] != self.args.image_size:
+                cross_attn_map = cross_attn_map.reshape(self.args.image_size, self.args.image_size)
+            # to [0, 1]
+            cross_attn_map = (cross_attn_map - cross_attn_map.min()) / (cross_attn_map.max() - cross_attn_map.min())
+
+            """ldm self-attention map"""
+            self_attention_maps, svd, vh_ = \
+                self.diffusion.get_self_attention_comp([prompts],
+                                                       controller,
+                                                       res=self.args.self_attn_res,
+                                                       from_where=("up", "down"),
+                                                       img_size=self.args.image_size,
+                                                       max_com=self.args.max_com,
+                                                       save_path=self.results_path,
+                                                       args=self.args)
+
+            # comp self-attention map
+            if self.args.mean_comp:
+                self_attn = np.mean(vh_, axis=0)
+                self.print(f"use the mean of {self.args.max_com} comps.")
+            else:
+                self_attn = vh_[self.args.comp_idx]
+                self.print(f"select {self.args.comp_idx}-th comp.")
+            # to [0, 1]
+            self_attn = (self_attn - self_attn.min()) / (self_attn.max() - self_attn.min())
+            # visual final self-attention
+            self_attn_vis = np.copy(self_attn)
+            self_attn_vis = self_attn_vis * 255
+            self_attn_vis = np.repeat(np.expand_dims(self_attn_vis, axis=2), 3, axis=2).astype(np.uint8)
+            view_images(self_attn_vis, save_image=not self.args.dataset, fp=self.results_path / "self-attn-final.png")
+
+            """attention map fusion"""
+            attn_map = self.args.attn_coeff * cross_attn_map + (1 - self.args.attn_coeff) * self_attn
+            # to [0, 1]
+            attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min())
+
+            self.print(f"-> fusion attn_map: {attn_map.shape}")
+        else:
+            attn_map = None
+
+        return target_file.as_posix(), attn_map, target_img
+
+
+    # diffusion model
     def extract_ldm_attn(self, prompts):
         # init controller
         controller = AttentionStore() if self.args.attention_init else EmptyControl()
@@ -229,27 +357,233 @@ class DiffSketcherPipeline(ModelState):
         xs = torch.cat(x_augs, dim=0)
         ys = torch.cat(y_augs, dim=0)
         return xs, ys
+    
+    def making_dataset(self, prompt: str, img_path = None, args = None):
+        # log prompts
+        self.print(f"prompt: {prompt}")
+        self.print(f"negative_prompt: {self.args.negative_prompt}\n")
+        self.print(f"\ntotal optimization steps: {self.args.num_iter}")
+        if self.args.negative_prompt is None:
+            self.args.negative_prompt = ""
 
-    def painterly_rendering(self, prompt: str):
+        data_root = '/data/hwkwak/sketch2head/data/'
+         
+        dataset = Sketchdataset(data_root, None, transform=transforms.ToTensor())
+        subset_range = range(args.start_idx, args.end_idx)
+        subset = Subset(dataset, subset_range)
+
+        dataloader = DataLoader(subset, batch_size=1, shuffle=False)
+        stroke_dataset = os.path.join(data_root, "stroke")
+        os.makedirs(stroke_dataset, exist_ok=True)
+
+        for i, batch in enumerate(dataloader):  
+            start_time = time.time()
+            img  = batch['img'].cuda()
+            img = img.squeeze()
+            # breakpoint()
+            # init attention
+            target_file, attention_map, target_img = self.custom_extract_ldm_attn(prompt, img_path, img=img)
+            if args.clipasso_loss == False:
+                perceptual_loss_fn = None
+                if self.args.perceptual.coeff > 0:
+                    self.print(f"-> perceptual: {self.args.perceptual.name}")
+                    if self.args.perceptual.name == "lpips":
+                        lpips_loss_fn = LPIPS(net=self.args.perceptual.lpips_net).to(self.device)
+                        perceptual_loss_fn = partial(lpips_loss_fn.forward, return_per_layer=False, normalize=False)
+                    elif self.args.perceptual.name == "dists":
+                        perceptual_loss_fn = DISTS_PIQ()
+
+            inputs, mask = self.get_target(target_img,
+                                        self.args.image_size,
+                                        self.results_path,
+                                        self.args.u2net_path,
+                                        self.args.mask_object,
+                                        self.args.fix_scale,
+                                        self.device)
+            inputs = inputs.detach()  # inputs as GT
+            # self.print("inputs shape: ", inputs.shape)
+
+            # load renderer
+            renderer = Painter(self.args,
+                            num_strokes=self.args.num_paths,
+                            num_segments=self.args.num_segments,
+                            imsize=self.args.image_size,
+                            device=self.device,
+                            target_im=inputs,
+                            attention_map=attention_map,
+                            mask=mask)
+
+            # init img
+            img = renderer.init_image(stage=0)
+            # self.print("init_image shape: ", img.shape)
+            # load optimizer
+            optimizer = SketchPainterOptimizer(renderer,
+                                            self.args.lr,
+                                            self.args.optim_opacity,
+                                            self.args.optim_rgba,
+                                            self.args.color_lr,
+                                            self.args.optim_width,
+                                            self.args.width_lr)
+            optimizer.init_optimizers()
+
+            # log params
+            # self.print(f"-> Painter points Params: {len(renderer.get_points_params())}")
+            # self.print(f"-> Painter width Params: {len(renderer.get_width_parameters())}")
+            # self.print(f"-> Painter opacity Params: {len(renderer.get_color_parameters())}")
+
+            best_iter_v, best_iter_s = 0, 0
+            self.step = 0
+            with tqdm(initial=self.step, total=self.args.num_iter, disable=not self.accelerator.is_main_process) as pbar:
+                while self.step < self.args.num_iter:
+                    raster_sketch = renderer.get_image().to(self.device)
+                    min_loss = 100
+
+                    # CLIP data augmentation
+                    raster_sketch_aug, inputs_aug = self.clip_pair_augment(
+                        raster_sketch, inputs,
+                        im_res=224,
+                        augments=self.cargs.augmentations,
+                        num_aug=self.cargs.num_aug
+                    )
+                    if args.clipasso_loss == False:
+                        # ASDS loss
+                        sds_loss, grad = torch.tensor(0), torch.tensor(0)
+                        if self.step >= self.args.sds.warmup:
+                            grad_scale = self.args.sds.grad_scale if self.step > self.args.sds.warmup else 0
+                            sds_loss, grad = self.diffusion.score_distillation_sampling(
+                                raster_sketch,
+                                crop_size=self.args.sds.crop_size,
+                                augments=self.args.sds.augmentations,
+                                prompt=[self.args.prompt],
+                                negative_prompt=[self.args.negative_prompt],
+                                guidance_scale=self.args.sds.guidance_scale,
+                                grad_scale=grad_scale,
+                                t_range=list(self.args.sds.t_range),
+                        )
+                        # clip visual loss
+                        total_visual_loss = torch.tensor(0)
+                        l_clip_fc, l_clip_conv, clip_conv_loss_sum = torch.tensor(0), [], torch.tensor(0)
+                        if self.args.clip.vis_loss > 0:
+                            l_clip_fc, l_clip_conv = self.clip_score_fn.compute_visual_distance(
+                                raster_sketch_aug, inputs_aug, clip_norm=False
+                            )
+                            clip_conv_loss_sum = sum(l_clip_conv)
+                            total_visual_loss = self.args.clip.vis_loss * (clip_conv_loss_sum + l_clip_fc)
+
+                        # perceptual loss
+                        l_percep = torch.tensor(0.)
+                        if perceptual_loss_fn is not None:
+                            l_perceptual = perceptual_loss_fn(raster_sketch, inputs).mean()
+                            l_percep = l_perceptual * self.args.perceptual.coeff
+
+                        # text-visual loss
+                        l_tvd = torch.tensor(0.)
+                        if self.cargs.text_visual_coeff > 0:
+                            loss_eval_seman = self.clip_score_fn.compute_text_visual_distance(
+                                raster_sketch_aug, self.args.prompt
+                            ) 
+                            l_tvd = loss_eval_seman * self.cargs.text_visual_coeff
+                            
+                        # total loss
+                        loss = sds_loss + total_visual_loss + l_percep + l_tvd
+                          # log the best raster images and SVG
+                 
+                        with torch.no_grad():
+                            # visual metric
+                            if min_loss > loss:
+                                min_loss = loss
+                                best_iter_v = self.step
+                                best_img = raster_sketch
+                                best_points = renderer.get_points_params()
+                                    # loss_eval_visual = sum(l_clip_conv) + l_clip_fc
+
+                                    # cur_delta = loss_eval_visual.item() - best_visual_loss
+                                    # if abs(cur_delta) > min_delta and cur_delta < 0:
+                                    #     best_visual_loss = loss_eval_visual.item()
+                                    #     best_iter_v = self.step
+                                    #     best_visual_img = raster_sketch
+                                    #     best_visual_points = renderer.get_points_params()
+                    else:
+                        losses_dict = Loss(args)(raster_sketch, inputs.detach(), renderer.get_color_parameters(), renderer, 0, optimizer)
+                        
+                        loss = sum(list(losses_dict.values()))
+                    # optimization
+                    optimizer.zero_grad_()
+                    loss.backward()
+                    optimizer.step_()
+
+                    # if self.step % self.args.pruning_freq == 0:
+                    #     renderer.path_pruning()
+
+                    # update lr
+                    if self.args.lr_scheduler:
+                        optimizer.update_lr(self.step, self.args.decay_steps)
+
+                    if args.clipasso_loss == False:
+                        # records
+                        pbar.set_description(
+                            f"lr: {optimizer.get_lr():.2f}, "
+                            f"l_total: {loss.item():.4f}, "
+                            f"l_clip_fc: {l_clip_fc.item():.4f}, "
+                            f"l_clip_conv({len(l_clip_conv)}): {clip_conv_loss_sum.item():.4f}, "
+                            f"l_tvd: {l_tvd.item():.4f}, "
+                            f"l_percep: {l_percep.item():.4f}, "
+                            f"sds: {grad.item():.4e}"
+                        )
+                    else:
+                        # edit records
+                        # pbar.set_description(
+                        #     # f"lr: {optimizer.get_lr()}, "
+                        #     f"l_total: {loss:.4f}, "
+                        #     f"l_clip: {losses_dict['clip']:.4f}, "
+                        #     f"l_clip_conv: {losses_dict['clip_conv_loss']:.4f}, "
+                        # )
+                        # print(f"lr: {str(optimizer.get_lr())}, "
+                        #     f"l_total: {loss:.4f}, "
+                        #     f"l_clip: {losses_dict['clip']:.4f}, "
+                        #     f"l_clip_conv: {losses_dict['clip_conv_loss']:.4f}, ")
+                        pass
+
+                    self.step += 1
+                    pbar.update(1)
+
+            # print(f"Best Visual Loss: {best_visual_loss:.4f}, Best Semantic Loss: {best_semantic_loss:.4f}")
+            
+            # save raster img
+
+            save_tensor_img(best_img,
+                            save_path=os.path.join(stroke_dataset, f"{batch['seed'][0]:05d}"),
+                            name=batch['name'][0])
+            
+            save_points_param(best_points,
+                            save_path=os.path.join(stroke_dataset, f"{batch['seed'][0]:05d}"),
+                            name=batch['name'][0])
+            end_time = time.time()
+            self.print(f"elapsed time: {end_time-start_time:.6f}sec")
+            self.print(f"best_iter_v: {best_iter_v}")
+            self.print(f"current seed: {int((i+args.start_idx) / 10)}")
+        self.close(msg="making dataset complete.")
+
+    def painterly_rendering(self, prompt: str, img_path = None, args = None):
         # log prompts
         self.print(f"prompt: {prompt}")
         self.print(f"negative_prompt: {self.args.negative_prompt}\n")
         if self.args.negative_prompt is None:
             self.args.negative_prompt = ""
-
         # init attention
-        target_file, attention_map = self.extract_ldm_attn(prompt)
+        target_file, attention_map, target_img = self.custom_extract_ldm_attn(prompt, img_path)
 
-        perceptual_loss_fn = None
-        if self.args.perceptual.coeff > 0:
-            self.print(f"-> perceptual: {self.args.perceptual.name}")
-            if self.args.perceptual.name == "lpips":
-                lpips_loss_fn = LPIPS(net=self.args.perceptual.lpips_net).to(self.device)
-                perceptual_loss_fn = partial(lpips_loss_fn.forward, return_per_layer=False, normalize=False)
-            elif self.args.perceptual.name == "dists":
-                perceptual_loss_fn = DISTS_PIQ()
+        if args.clipasso_loss == False:
+            perceptual_loss_fn = None
+            if self.args.perceptual.coeff > 0:
+                self.print(f"-> perceptual: {self.args.perceptual.name}")
+                if self.args.perceptual.name == "lpips":
+                    lpips_loss_fn = LPIPS(net=self.args.perceptual.lpips_net).to(self.device)
+                    perceptual_loss_fn = partial(lpips_loss_fn.forward, return_per_layer=False, normalize=False)
+                elif self.args.perceptual.name == "dists":
+                    perceptual_loss_fn = DISTS_PIQ()
 
-        inputs, mask = self.get_target(target_file,
+        inputs, mask = self.get_target(target_img,
                                        self.args.image_size,
                                        self.results_path,
                                        self.args.u2net_path,
@@ -272,7 +606,8 @@ class DiffSketcherPipeline(ModelState):
         # init img
         img = renderer.init_image(stage=0)
         self.print("init_image shape: ", img.shape)
-        log_tensor_img(img, self.results_path, output_prefix="init_sketch")
+        if args.dataset==False:
+            log_tensor_img(img, self.results_path, output_prefix="init_sketch")
         # load optimizer
         optimizer = SketchPainterOptimizer(renderer,
                                            self.args.lr,
@@ -298,25 +633,11 @@ class DiffSketcherPipeline(ModelState):
                 raster_sketch = renderer.get_image().to(self.device)
 
                 # log video
-                if self.make_video and \
-                        (self.step % self.args.video_frame_freq == 0 or self.step == self.args.num_iter - 1):
-                    log_tensor_img(raster_sketch, self.frame_log_dir, output_prefix=f"iter{self.frame_idx}")
-                    self.frame_idx += 1
-
-                # ASDS loss
-                sds_loss, grad = torch.tensor(0), torch.tensor(0)
-                if self.step >= self.args.sds.warmup:
-                    grad_scale = self.args.sds.grad_scale if self.step > self.args.sds.warmup else 0
-                    sds_loss, grad = self.diffusion.score_distillation_sampling(
-                        raster_sketch,
-                        crop_size=self.args.sds.crop_size,
-                        augments=self.args.sds.augmentations,
-                        prompt=[self.args.prompt],
-                        negative_prompt=[self.args.negative_prompt],
-                        guidance_scale=self.args.sds.guidance_scale,
-                        grad_scale=grad_scale,
-                        t_range=list(self.args.sds.t_range),
-                    )
+                if args.dataset==False:
+                    if self.make_video and \
+                            (self.step % self.args.video_frame_freq == 0 or self.step == self.args.num_iter - 1):
+                        log_tensor_img(raster_sketch, self.frame_log_dir, output_prefix=f"iter{self.frame_idx}")
+                        self.frame_idx += 1
 
                 # CLIP data augmentation
                 raster_sketch_aug, inputs_aug = self.clip_pair_augment(
@@ -325,33 +646,50 @@ class DiffSketcherPipeline(ModelState):
                     augments=self.cargs.augmentations,
                     num_aug=self.cargs.num_aug
                 )
-
-                # clip visual loss
-                total_visual_loss = torch.tensor(0)
-                l_clip_fc, l_clip_conv, clip_conv_loss_sum = torch.tensor(0), [], torch.tensor(0)
-                if self.args.clip.vis_loss > 0:
-                    l_clip_fc, l_clip_conv = self.clip_score_fn.compute_visual_distance(
-                        raster_sketch_aug, inputs_aug, clip_norm=False
+                if args.clipasso_loss == False:
+                    # ASDS loss
+                    sds_loss, grad = torch.tensor(0), torch.tensor(0)
+                    if self.step >= self.args.sds.warmup:
+                        grad_scale = self.args.sds.grad_scale if self.step > self.args.sds.warmup else 0
+                        sds_loss, grad = self.diffusion.score_distillation_sampling(
+                            raster_sketch,
+                            crop_size=self.args.sds.crop_size,
+                            augments=self.args.sds.augmentations,
+                            prompt=[self.args.prompt],
+                            negative_prompt=[self.args.negative_prompt],
+                            guidance_scale=self.args.sds.guidance_scale,
+                            grad_scale=grad_scale,
+                            t_range=list(self.args.sds.t_range),
                     )
-                    clip_conv_loss_sum = sum(l_clip_conv)
-                    total_visual_loss = self.args.clip.vis_loss * (clip_conv_loss_sum + l_clip_fc)
+                    # clip visual loss
+                    total_visual_loss = torch.tensor(0)
+                    l_clip_fc, l_clip_conv, clip_conv_loss_sum = torch.tensor(0), [], torch.tensor(0)
+                    if self.args.clip.vis_loss > 0:
+                        l_clip_fc, l_clip_conv = self.clip_score_fn.compute_visual_distance(
+                            raster_sketch_aug, inputs_aug, clip_norm=False
+                        )
+                        clip_conv_loss_sum = sum(l_clip_conv)
+                        total_visual_loss = self.args.clip.vis_loss * (clip_conv_loss_sum + l_clip_fc)
 
-                # perceptual loss
-                l_percep = torch.tensor(0.)
-                if perceptual_loss_fn is not None:
-                    l_perceptual = perceptual_loss_fn(raster_sketch, inputs).mean()
-                    l_percep = l_perceptual * self.args.perceptual.coeff
+                    # perceptual loss
+                    l_percep = torch.tensor(0.)
+                    if perceptual_loss_fn is not None:
+                        l_perceptual = perceptual_loss_fn(raster_sketch, inputs).mean()
+                        l_percep = l_perceptual * self.args.perceptual.coeff
 
-                # text-visual loss
-                l_tvd = torch.tensor(0.)
-                if self.cargs.text_visual_coeff > 0:
-                    l_tvd = self.clip_score_fn.compute_text_visual_distance(
-                        raster_sketch_aug, self.args.prompt
-                    ) * self.cargs.text_visual_coeff
+                    # text-visual loss
+                    l_tvd = torch.tensor(0.)
+                    if self.cargs.text_visual_coeff > 0:
+                        l_tvd = self.clip_score_fn.compute_text_visual_distance(
+                            raster_sketch_aug, self.args.prompt
+                        ) * self.cargs.text_visual_coeff
 
-                # total loss
-                loss = sds_loss + total_visual_loss + l_percep + l_tvd
-
+                    # total loss
+                    loss = sds_loss + total_visual_loss + l_percep + l_tvd
+                else:
+                    losses_dict = Loss(args)(raster_sketch, inputs.detach(), renderer.get_color_parameters(), renderer, 0, optimizer)
+                    
+                    loss = sum(list(losses_dict.values()))
                 # optimization
                 optimizer.zero_grad_()
                 loss.backward()
@@ -364,124 +702,143 @@ class DiffSketcherPipeline(ModelState):
                 if self.args.lr_scheduler:
                     optimizer.update_lr(self.step, self.args.decay_steps)
 
-                # records
-                pbar.set_description(
-                    f"lr: {optimizer.get_lr():.2f}, "
-                    f"l_total: {loss.item():.4f}, "
-                    f"l_clip_fc: {l_clip_fc.item():.4f}, "
-                    f"l_clip_conv({len(l_clip_conv)}): {clip_conv_loss_sum.item():.4f}, "
-                    f"l_tvd: {l_tvd.item():.4f}, "
-                    f"l_percep: {l_percep.item():.4f}, "
-                    f"sds: {grad.item():.4e}"
-                )
+                if args.clipasso_loss == False:
+                    # records
+                    pbar.set_description(
+                        f"lr: {optimizer.get_lr():.2f}, "
+                        f"l_total: {loss.item():.4f}, "
+                        f"l_clip_fc: {l_clip_fc.item():.4f}, "
+                        f"l_clip_conv({len(l_clip_conv)}): {clip_conv_loss_sum.item():.4f}, "
+                        f"l_tvd: {l_tvd.item():.4f}, "
+                        f"l_percep: {l_percep.item():.4f}, "
+                        f"sds: {grad.item():.4e}"
+                    )
+                else:
+                    # edit records
+                    # pbar.set_description(
+                    #     # f"lr: {optimizer.get_lr()}, "
+                    #     f"l_total: {loss:.4f}, "
+                    #     f"l_clip: {losses_dict['clip']:.4f}, "
+                    #     f"l_clip_conv: {losses_dict['clip_conv_loss']:.4f}, "
+                    # )
+                    # print(f"lr: {str(optimizer.get_lr())}, "
+                    #     f"l_total: {loss:.4f}, "
+                    #     f"l_clip: {losses_dict['clip']:.4f}, "
+                    #     f"l_clip_conv: {losses_dict['clip_conv_loss']:.4f}, ")
+                    pass
 
+                if args.dataset == False:
                 # log raster and svg
-                if self.step % self.args.save_step == 0 and self.accelerator.is_main_process:
-                    # log png
-                    plt_batch(inputs,
-                              raster_sketch,
-                              self.step,
-                              prompt,
-                              save_path=self.png_logs_dir.as_posix(),
-                              name=f"iter{self.step}")
-                    # log svg
-                    renderer.save_svg(self.svg_logs_dir.as_posix(), f"svg_iter{self.step}")
-                    # log cross attn
-                    if self.args.log_cross_attn:
-                        controller = AttentionStore()
-                        _, _ = self.diffusion.get_cross_attention([self.args.prompt],
-                                                                  controller,
-                                                                  res=self.args.cross_attn_res,
-                                                                  from_where=("up", "down"),
-                                                                  save_path=self.attn_logs_dir / f"iter{self.step}.png")
+                    if self.step % self.args.save_step == 0 and self.accelerator.is_main_process:
+                        # log png
+                        plt_batch(inputs,
+                                raster_sketch,
+                                self.step,
+                                prompt,
+                                save_path=self.png_logs_dir.as_posix(),
+                                name=f"iter{self.step}")
+                        # log svg
+                        renderer.save_svg(self.svg_logs_dir.as_posix(), f"svg_iter{self.step}")
+                        # log cross attn
+                        if self.args.log_cross_attn:
+                            controller = AttentionStore()
+                            _, _ = self.diffusion.get_cross_attention([self.args.prompt],
+                                                                    controller,
+                                                                    res=self.args.cross_attn_res,
+                                                                    from_where=("up", "down"),
+                                                                    save_path=self.attn_logs_dir / f"iter{self.step}.png")
 
-                # log the best raster images and SVG
-                if self.step % self.args.eval_step == 0 and self.accelerator.is_main_process:
-                    with torch.no_grad():
-                        # visual metric
-                        l_clip_fc, l_clip_conv = self.clip_score_fn.compute_visual_distance(
-                            raster_sketch_aug, inputs_aug, clip_norm=False
-                        )
-                        loss_eval = sum(l_clip_conv) + l_clip_fc
+                    # log the best raster images and SVG
+                    if self.step % self.args.eval_step == 0 and self.accelerator.is_main_process:
+                        with torch.no_grad():
+                            # visual metric
+                            l_clip_fc, l_clip_conv = self.clip_score_fn.compute_visual_distance(
+                                raster_sketch_aug, inputs_aug, clip_norm=False
+                            )
+                            loss_eval = sum(l_clip_conv) + l_clip_fc
 
-                        cur_delta = loss_eval.item() - best_visual_loss
-                        if abs(cur_delta) > min_delta and cur_delta < 0:
-                            best_visual_loss = loss_eval.item()
-                            best_iter_v = self.step
-                            plt_batch(inputs,
-                                      raster_sketch,
-                                      best_iter_v,
-                                      prompt,
-                                      save_path=self.results_path.as_posix(),
-                                      name="visual_best")
-                            renderer.save_svg(self.results_path.as_posix(), "visual_best")
+                            cur_delta = loss_eval.item() - best_visual_loss
+                            if abs(cur_delta) > min_delta and cur_delta < 0:
+                                best_visual_loss = loss_eval.item()
+                                best_iter_v = self.step
+                                plt_batch(inputs,
+                                        raster_sketch,
+                                        best_iter_v,
+                                        prompt,
+                                        save_path=self.results_path.as_posix(),
+                                        name="visual_best")
+                                renderer.save_svg(self.results_path.as_posix(), "visual_best")
 
-                        # semantic metric
-                        loss_eval = self.clip_score_fn.compute_text_visual_distance(
-                            raster_sketch_aug, self.args.prompt
-                        )
-                        cur_delta = loss_eval.item() - best_semantic_loss
-                        if abs(cur_delta) > min_delta and cur_delta < 0:
-                            best_semantic_loss = loss_eval.item()
-                            best_iter_s = self.step
-                            plt_batch(inputs,
-                                      raster_sketch,
-                                      best_iter_s,
-                                      prompt,
-                                      save_path=self.results_path.as_posix(),
-                                      name="semantic_best")
-                            renderer.save_svg(self.results_path.as_posix(), "semantic_best")
+                            # semantic metric
+                            loss_eval = self.clip_score_fn.compute_text_visual_distance(
+                                raster_sketch_aug, self.args.prompt
+                            )
+                            cur_delta = loss_eval.item() - best_semantic_loss
+                            if abs(cur_delta) > min_delta and cur_delta < 0:
+                                best_semantic_loss = loss_eval.item()
+                                best_iter_s = self.step
+                                plt_batch(inputs,
+                                        raster_sketch,
+                                        best_iter_s,
+                                        prompt,
+                                        save_path=self.results_path.as_posix(),
+                                        name="semantic_best")
+                                renderer.save_svg(self.results_path.as_posix(), "semantic_best")
 
-                # log attention
-                if self.step == 0 and self.args.attention_init and self.accelerator.is_main_process:
-                    plt_attn(renderer.get_attn(),
-                             renderer.get_thresh(),
-                             inputs,
-                             renderer.get_inds(),
-                             (self.results_path / "attention_map.jpg").as_posix())
+                    # log attention
+                    if self.step == 0 and self.args.attention_init and self.accelerator.is_main_process:
+                        plt_attn(renderer.get_attn(),
+                                renderer.get_thresh(),
+                                inputs,
+                                renderer.get_inds(),
+                                (self.results_path / "attention_map.jpg").as_posix())
 
                 self.step += 1
                 pbar.update(1)
 
-        # saving final svg
-        renderer.save_svg(self.svg_logs_dir.as_posix(), "final_svg_tmp")
-        # stroke pruning
-        if self.args.opacity_delta != 0:
-            remove_low_opacity_paths(self.svg_logs_dir / "final_svg_tmp.svg",
-                                     self.results_path / "final_svg.svg",
-                                     self.args.opacity_delta)
+        print(f"Best Visual Loss: {best_visual_loss:.4f}, Best Semantic Loss: {best_semantic_loss:.4f}")
+        
+        if args.dataset==False:
+            # saving final svg
+            renderer.save_svg(self.svg_logs_dir.as_posix(), "final_svg_tmp")
+            # stroke pruning
+            if self.args.opacity_delta != 0:
+                remove_low_opacity_paths(self.svg_logs_dir / "final_svg_tmp.svg",
+                                        self.results_path / "final_svg.svg",
+                                        self.args.opacity_delta)
 
         # save raster img
         final_raster_sketch = renderer.get_image().to(self.device)
         save_tensor_img(final_raster_sketch,
                         save_path=self.results_path,
                         name='final_render')
-
-        # convert the intermediate renderings to a video
-        if self.args.make_video:
-            from subprocess import call
-            call([
-                "ffmpeg",
-                "-framerate", f"{self.args.video_frame_rate}",
-                "-i", (self.frame_log_dir / "iter%d.png").as_posix(),
-                "-vb", "20M",
-                (self.results_path / "out.mp4").as_posix()
-            ])
+        if args.dataset == False:
+            # convert the intermediate renderings to a video
+            if self.args.make_video:
+                from subprocess import call
+                call([
+                    "ffmpeg",
+                    "-framerate", f"{self.args.video_frame_rate}",
+                    "-i", (self.frame_log_dir / "iter%d.png").as_posix(),
+                    "-vb", "20M",
+                    (self.results_path / "out.mp4").as_posix()
+                ])
 
         self.close(msg="painterly rendering complete.")
 
     def get_target(self,
-                   target_file,
+                   target_img,
                    image_size,
                    output_dir,
                    u2net_path,
                    mask_object,
                    fix_scale,
                    device):
-        if not is_image_file(target_file):
-            raise TypeError(f"{target_file} is not image file.")
+        # if not is_image_file(target_file):
+        #     raise TypeError(f"{target_file} is not image file.")
 
-        target = Image.open(target_file)
+        # target = Image.open(target_file)
+        target = target_img
 
         if target.mode == "RGBA":
             # Create a white rgba background

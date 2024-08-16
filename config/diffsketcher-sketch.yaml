@@ -47,7 +47,7 @@ enable_xformers: True # speed up attn compute
 gradient_checkpoint: False # this slows down the code, but saves GPU VRAM
 token_ind: 1 # the index of CLIP prompt embedding, start from 1, 0 is start token
 use_ddim: True
-num_inference_steps: 100
+num_inference_steps: 1
 guidance_scale: 7.5 # sdxl default 5.0
 
 # ASDS loss
@@ -74,3 +74,22 @@ perceptual:
   name: "lpips" # dists, lpips
   lpips_net: 'vgg'
   coeff: 0.2
+
+# CLIPasso Loss
+percep_loss: None # default: None
+train_with_clip: 0 # default: 0
+clip_weight: 0         # default: 0
+start_clip: 0           # default: 0
+clip_conv_loss: 1       # default: 1
+clip_fc_loss_weight: 0.1 # default: 0.1
+clip_text_guide: 0     # default: 0
+
+# CLIPasso CLIPLoss 
+device: "cuda"
+num_aug_clip: 4
+augemntations: "affine"
+include_target_in_aug: 0
+augment_both: 1
+clip_model_name: "RN101"
+clip_conv_loss_type:  "L2"
+clip_conv_layer_weights: "0,0,1.0,1.0,0"

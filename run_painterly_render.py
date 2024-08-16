@@ -47,7 +47,10 @@ def main(args, seed_range):
 
         if not args.render_batch:
             pipe = DiffSketcherPipeline(args)
-            pipe.painterly_rendering(args.prompt)
+            if args.dataset == False:
+                pipe.painterly_rendering(args.prompt, img_path = args.img_path, args= args)
+            else:
+                pipe.making_dataset(args.prompt, args= args)
         else:  # generate many SVG at once
             render_batch_fn(pipeline=DiffSketcherPipeline, prompt=args.prompt)
 
@@ -82,6 +85,7 @@ if __name__ == '__main__':
     # prompt
     parser.add_argument("-pt", "--prompt", default="A horse is drinking water by the lake", type=str)
     parser.add_argument("-npt", "--negative_prompt", default="", type=str)
+    parser.add_argument("-img_path", "--img_path", default=None)
     # DiffSVG
     parser.add_argument("--print_timing", "-timing", action="store_true",
                         help="set print svg rendering timing.")
@@ -107,6 +111,12 @@ if __name__ == '__main__':
     parser.add_argument("-framerate", "--video_frame_rate",
                         default=36, type=int,
                         help="by adjusting the frame rate, you can control the playback speed of the output video.")
+    parser.add_argument("-clipasso_loss", "--clipasso_loss", default=False)
+
+    # make dataset
+    parser.add_argument("-dataset", "--dataset", default=False)
+    parser.add_argument("-start_idx", "--start_idx", default=None)
+    parser.add_argument("-end_idx", "--end_idx", default=None)
 
     args = parser.parse_args()
 
@@ -126,6 +136,8 @@ if __name__ == '__main__':
             seed_range = random.sample(numbers, k=1000)
 
     args = merge_and_update_config(args)
+    args.clip_conv_layer_weights = [
+        float(item) for item in args.clip_conv_layer_weights.split(',')]
 
     set_seed(args.seed)
     main(args, seed_range)
